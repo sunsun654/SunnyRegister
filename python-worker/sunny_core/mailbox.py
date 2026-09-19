@@ -233,8 +233,15 @@ def account_from_row(row: dict[str, Any]) -> MailAccount:
                 metadata = json.loads(access_key)
             except (TypeError, ValueError) as exc:
                 raise ValueError("Invalid domain mailbox credential JSON") from exc
+            if not isinstance(metadata, dict):
+                raise ValueError("Invalid domain mailbox credential JSON")
             if not str(metadata.get("base_url") or "").strip() or not str(metadata.get("auth_token") or "").strip():
                 raise ValueError("Domain mailbox credential is missing base_url or auth_token")
+            provider = str(metadata.get("provider") or "").strip().lower()
+            if provider in {"vps", "domain_mailbox_vps"}:
+                credential_email = str(metadata.get("email") or "").strip().lower()
+                if credential_email and credential_email != email.lower():
+                    raise ValueError("Invalid domain mailbox pickup URL")
         return MailAccount(
             email=email, password="", client_id="", refresh_token="", raw=raw or f"{email}----{access_key}",
             account_type=str(row.get("account_type") or "free"), openai_rt=str(row.get("openai_rt") or ""),
@@ -1486,6 +1493,263 @@ class DomainMailReader:
         raise TimeoutError(f"Timed out waiting for OpenAI email OTP via domain mailbox API（{detail}）")
 
 
+_ASCII_ALIASES = {"us-ascii", "ascii", "latin-1", "iso-8859-1", "windows-1252", "cp1252"}
+
+
+def _decode_mime_bytes(payload: bytes, charset: str) -> str:
+    """Decode MIME part bytes, tolerating the common us-ascii/latin-1 mislabel."""
+    try:
+        decoded = payload.decode(charset, errors="replace")
+    except LookupError:
+        decoded = payload.decode("utf-8", errors="replace")
+    if "\ufffd" in decoded and str(charset or "").strip().lower() in _ASCII_ALIASES:
+        # Senders regularly declare us-ascii while emitting UTF-8 bytes; prefer
+        # the UTF-8 reading when it decodes cleanly so non-ASCII text survives.
+        try:
+            decoded = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+    return decoded
+
+
+def _vps_mime_body(raw: str) -> tuple[str, str, str]:
+    """Decode a stored .eml document into (plain_text, subject, sender).
+
+    The VPS mail server persists the untouched MIME source, so quoted-printable
+    and base64 encoded parts must be decoded before the OTP can be scanned.
+    """
+    try:
+        message = email_pkg.message_from_string(str(raw or ""))
+    except Exception:
+        return "", "", ""
+    try:
+        subject = str(make_header(decode_header(str(message.get("Subject") or ""))))
+    except Exception:
+        subject = str(message.get("Subject") or "")
+    sender = str(message.get("From") or "")
+    plain_parts: list[str] = []
+    html_parts: list[str] = []
+    for part in message.walk():
+        if part.is_multipart():
+            continue
+        content_type = part.get_content_type()
+        if content_type not in {"text/plain", "text/html"}:
+            continue
+        try:
+            payload = part.get_payload(decode=True)
+        except Exception:
+            payload = None
+        if payload is None:
+            continue
+        charset = part.get_content_charset() or "utf-8"
+        decoded = _decode_mime_bytes(payload, charset)
+        if content_type == "text/plain":
+            plain_parts.append(decoded)
+        else:
+            html_parts.append(decoded)
+    if not plain_parts and not html_parts:
+        # Single-part messages without an explicit MIME structure.
+        try:
+            payload = message.get_payload(decode=True)
+        except Exception:
+            payload = None
+        if payload:
+            decoded = _decode_mime_bytes(payload, message.get_content_charset() or "utf-8")
+            if message.get_content_type() == "text/html":
+                html_parts.append(decoded)
+            else:
+                plain_parts.append(decoded)
+    body = "\n".join(plain_parts).strip()
+    if not body and html_parts:
+        body = "\n".join(_html_to_text(part) for part in html_parts).strip()
+    return body, subject, sender
+
+
+class VpsDomainReader:
+    """Adapter for the self-hosted domain-mailbox-vps mail server.
+
+    Reads ``GET {base_url}/v1/messages?address={email}&limit=N`` with the
+    mailbox-scoped token as an ``Authorization: Bearer`` credential, then decodes
+    the stored raw MIME document to recover the OpenAI verification code. Every
+    mailbox must carry its own token so a leaked credential only exposes a single
+    inbox.
+    """
+
+    DEFAULT_LIMIT = 10
+
+    def __init__(self, account: MailAccount, log: Callable[[str], None] | None, proxy_url: str = ""):
+        self.account = account
+        self.log = log or (lambda _m: None)
+        self.proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+        self.base_url = ""
+        self.auth_token = ""
+        access_key = str(account.access_key or "").strip()
+        try:
+            metadata = json.loads(access_key)
+        except (TypeError, ValueError) as exc:
+            raise MailboxAccessError("domain_credential_invalid", "自建域名邮箱凭证格式无效", terminal=True) from exc
+        if not isinstance(metadata, dict):
+            raise MailboxAccessError("domain_credential_invalid", "自建域名邮箱凭证格式无效", terminal=True)
+        provider = str(metadata.get("provider") or "").strip().lower()
+        self.base_url = str(metadata.get("base_url") or "").strip().rstrip("/")
+        self.auth_token = str(metadata.get("auth_token") or "").strip()
+        parsed = urlparse(self.base_url)
+        if provider not in {"vps", "domain_mailbox_vps"} or parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise MailboxAccessError("domain_credential_invalid", "自建域名邮箱取件 URL 无效或与邮箱不匹配", terminal=True)
+        if not self.auth_token:
+            raise MailboxAccessError("domain_credential_invalid", "自建域名邮箱凭证缺少 API 地址或 Authorization Token", terminal=True)
+        configured_email = str(metadata.get("email") or "").strip().lower()
+        if configured_email and configured_email != str(account.email or "").strip().lower():
+            raise MailboxAccessError("domain_credential_invalid", "自建域名邮箱取件 URL 与邮箱不匹配", terminal=True)
+        try:
+            self.limit = max(1, min(50, int(metadata.get("limit") or self.DEFAULT_LIMIT)))
+        except (TypeError, ValueError):
+            self.limit = self.DEFAULT_LIMIT
+        self.seen_keys: set[str] = set()
+        self.request_count = 0
+        self.last_status = 0
+        self.last_candidate_count = 0
+        self.last_error = ""
+
+    @staticmethod
+    def _timestamp(value: Any) -> float:
+        raw = str(value or "").strip()
+        if not raw:
+            return 0.0
+        if re.fullmatch(r"\d+(?:\.\d+)?", raw):
+            numeric = float(raw)
+            if numeric > 1e14:
+                numeric /= 1_000_000
+            elif numeric > 1e11:
+                numeric /= 1_000
+            return numeric if numeric > 0 else 0.0
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+
+    def _request(self) -> list[dict[str, Any]]:
+        self.request_count += 1
+        try:
+            response = requests.get(
+                f"{self.base_url}/v1/messages",
+                params={"address": self.account.email, "limit": self.limit},
+                headers={"Authorization": f"Bearer {self.auth_token}", "Accept": "application/json", "User-Agent": "SunnyRegister/1.0"},
+                timeout=30,
+                proxies=self.proxies,
+            )
+        except requests.RequestException as exc:
+            self.last_error = str(exc)
+            if self.request_count == 1 or self.request_count % 10 == 0:
+                self.log(f"[{self.account.email}] 自建域名邮箱取件 API 网络请求失败（第 {self.request_count} 次）：{str(exc)[:220]}")
+            raise MailboxAccessError("domain_network_error", "自建域名邮箱接口连接失败", str(exc)) from exc
+        try:
+            self.last_status = int(response.status_code or 0)
+            if response.status_code in {401, 403, 404}:
+                self.last_error = f"HTTP {response.status_code}"
+                self.log(f"[{self.account.email}] 自建域名邮箱取件 API 返回 HTTP {response.status_code}，凭证或邮箱状态校验失败")
+                raise MailboxAccessError("domain_credential_invalid", "自建域名邮箱取件凭证无效或邮箱已停用", f"HTTP {response.status_code}", terminal=True)
+            if not response.ok:
+                self.last_error = f"HTTP {response.status_code}"
+                if self.request_count == 1 or self.request_count % 10 == 0:
+                    self.log(f"[{self.account.email}] 自建域名邮箱取件 API 返回 HTTP {response.status_code}（第 {self.request_count} 次）")
+                raise MailboxAccessError("domain_provider_failed", "自建域名邮箱接口请求失败", f"HTTP {response.status_code}")
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                self.last_error = "invalid_json"
+                self.log(f"[{self.account.email}] 自建域名邮箱取件 API 返回内容不是有效 JSON（HTTP {response.status_code}）")
+                raise MailboxAccessError("domain_response_invalid", "自建域名邮箱接口返回了无法解析的 JSON", str(exc), terminal=True) from exc
+        finally:
+            response.close()
+        if isinstance(payload, dict):
+            results = payload.get("results")
+        elif isinstance(payload, list):
+            results = payload
+        else:
+            results = None
+        if not isinstance(results, list):
+            self.log(f"[{self.account.email}] 自建域名邮箱取件 API 返回结构无法识别（缺少 results 数组）")
+            raise MailboxAccessError("domain_response_invalid", "自建域名邮箱接口返回了无法解析的响应", "missing results", terminal=True)
+        return [item for item in results if isinstance(item, dict)]
+
+    def _latest(self) -> dict[str, Any]:
+        candidates: list[dict[str, Any]] = []
+        for order, item in enumerate(self._request()):
+            body, subject, sender = _vps_mime_body(str(item.get("raw") or ""))
+            code = ""
+            match = re.search(r"(?<!\d)(\d{6})(?!\d)", body)
+            if match:
+                code = match.group(1)
+            if not code:
+                subject_match = re.search(r"(?<!\d)(\d{6})(?!\d)", subject)
+                if subject_match:
+                    code = subject_match.group(1)
+            if not code:
+                continue
+            timestamp = self._timestamp(item.get("created_at") or item.get("createdAt"))
+            message_id = item.get("id") or item.get("message_id")
+            candidates.append({
+                "code": code,
+                "key": f"{message_id or timestamp}:{code}",
+                "timestamp": timestamp,
+                "order": order,
+                "body": body,
+                "id": message_id,
+                "sender": sender or item.get("source"),
+                "recipient": item.get("address") or self.account.email,
+                "subject": subject,
+                "date": item.get("created_at") or "",
+            })
+        self.last_candidate_count = len(candidates)
+        if self.request_count == 1 or self.request_count % 10 == 0:
+            self.log(f"[{self.account.email}] 自建域名邮箱取件 API：HTTP {self.last_status or '未知'}，第 {self.request_count} 次查询，识别到 {self.last_candidate_count} 封验证码邮件")
+        return max(candidates, key=lambda item: (float(item.get("timestamp") or 0), -int(item.get("order") or 0)), default={})
+
+    def connect(self, access_token: str | None = None) -> None:
+        current = self._latest()
+        if current.get("key"):
+            self.seen_keys.add(str(current["key"]))
+
+    def close(self) -> None:
+        return None
+
+    def latest_message(self) -> dict[str, Any]:
+        current = self._latest()
+        return {"id": current.get("id") or current.get("key", "domain"), "email": self.account.email, "from": current.get("sender", ""), "to": current.get("recipient", self.account.email), "subject": current.get("subject") or "Domain mailbox", "date": current.get("date", ""), "body": current.get("body", ""), "body_preview": current.get("body", ""), "otp": current.get("code", ""), "source": "domain_api"}
+
+    def wait_for_code(self, min_timestamp: float, timeout: int = 120) -> str:
+        started = time.monotonic()
+        last_error_notice = 0.0
+        while time.monotonic() - started < timeout:
+            remaining = max(1, int(timeout - (time.monotonic() - started)))
+            try:
+                current = self._latest()
+            except MailboxAccessError as exc:
+                if exc.terminal:
+                    raise
+                if time.monotonic() - last_error_notice >= 20:
+                    self.log(f"[{self.account.email}] 自建域名邮箱 API 暂时不可用，将继续重试：{str(exc)[:180]}")
+                    last_error_notice = time.monotonic()
+                time.sleep(min(3, remaining))
+                continue
+            timestamp = float(current.get("timestamp") or 0)
+            key = str(current.get("key") or "")
+            code = str(current.get("code") or "").strip()
+            if code and re.fullmatch(r"\d{6}", code) and key not in self.seen_keys and (not timestamp or timestamp >= float(min_timestamp or 0)):
+                self.seen_keys.add(key)
+                self.log(f"[{self.account.email}] 已通过自建域名邮箱 API 收到验证码（已脱敏）")
+                return code
+            time.sleep(min(2, remaining))
+        detail = f"HTTP {self.last_status or '未知'}，累计查询 {self.request_count} 次，最近识别到 {self.last_candidate_count} 封验证码邮件"
+        if self.last_error:
+            detail += f"，最近错误：{self.last_error[:180]}"
+        raise TimeoutError(f"Timed out waiting for OpenAI email OTP via domain mailbox API（{detail}）")
+
+
 class URLAPIICloudReader:
     """Slow URL-based iCloud adapter returning the newest mailbox message page."""
 
@@ -1793,8 +2057,24 @@ class URLAPIICloudReader:
         raise TimeoutError("Timed out waiting for OpenAI email OTP")
 
 
+def _domain_credential_provider(access_key: str) -> str:
+    """Return the credential dialect: ``vps`` or the legacy ``cloudmail`` shape."""
+    value = str(access_key or "").strip()
+    if not value.startswith("{"):
+        return "cloudmail"
+    try:
+        metadata = json.loads(value)
+    except (TypeError, ValueError):
+        return "cloudmail"
+    if not isinstance(metadata, dict):
+        return "cloudmail"
+    return str(metadata.get("provider") or "").strip().lower()
+
+
 def create_mailbox_reader(account: MailAccount, log: Callable[[str], None] | None, proxy_url: str = ""):
     if account.mailbox_type == "domain" or account.mailbox_channel == "domain_api":
+        if _domain_credential_provider(account.access_key) in {"vps", "domain_mailbox_vps"}:
+            return VpsDomainReader(account, log, proxy_url)
         return DomainMailReader(account, log, proxy_url)
     if account.mailbox_type == "remail" or account.mailbox_channel == "remail_api":
         return RemailReader(account, log, proxy_url)

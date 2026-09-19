@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -10,7 +11,11 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"mime"
+	"mime/multipart"
+	"mime/quotedprintable"
 	"net/http"
+	"net/mail"
 	"net/url"
 	"os"
 	"regexp"
@@ -20,6 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/text/encoding/ianaindex"
 	"gorm.io/gorm"
 )
 
@@ -48,14 +54,32 @@ type domainMailClient struct {
 	baseURL      string
 	token        string
 	sitePassword string
+	provider     string
 	client       *http.Client
+}
+
+// domainMailProvider normalizes the configured provider dialect. The legacy
+// CloudMail/CF Worker flow keeps its shared token and site password; the
+// self-hosted domain-mailbox-vps flow authenticates with a single admin bearer
+// token and creates mailboxes through the stable /v1 API.
+func domainMailProvider(cfg map[string]any) string {
+	switch strings.ToLower(strings.TrimSpace(text(cfg["provider"]))) {
+	case "vps", "domain_mailbox_vps", "domain-mailbox-vps":
+		return "vps"
+	default:
+		return "cloudmail"
+	}
 }
 
 func newDomainMailClient(cfg map[string]any) (*domainMailClient, error) {
 	base := strings.TrimRight(strings.TrimSpace(text(cfg["base_url"])), "/")
 	token := strings.TrimSpace(text(cfg["auth_token"]))
 	sitePassword := strings.TrimSpace(text(cfg["site_password"]))
-	if base == "" || token == "" || sitePassword == "" {
+	provider := domainMailProvider(cfg)
+	if base == "" || token == "" {
+		return nil, fmt.Errorf("自建域名邮箱配置不完整：请填写 API 地址、PUBLIC_API_TOKEN、站点密码和邮箱域名")
+	}
+	if provider != "vps" && sitePassword == "" {
 		return nil, fmt.Errorf("自建域名邮箱配置不完整：请填写 API 地址、PUBLIC_API_TOKEN、站点密码和邮箱域名")
 	}
 	if _, err := domainMailboxDomains(cfg); err != nil {
@@ -65,7 +89,7 @@ func newDomainMailClient(cfg map[string]any) (*domainMailClient, error) {
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		return nil, fmt.Errorf("自建域名邮箱 API 地址无效")
 	}
-	return &domainMailClient{baseURL: base, token: token, sitePassword: sitePassword, client: &http.Client{Timeout: 30 * time.Second}}, nil
+	return &domainMailClient{baseURL: base, token: token, sitePassword: sitePassword, provider: provider, client: &http.Client{Timeout: 30 * time.Second}}, nil
 }
 
 func domainMailboxDomains(cfg map[string]any) ([]string, error) {
@@ -177,9 +201,13 @@ func (c *domainMailClient) request(ctx context.Context, method, path string, bod
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", c.token)
-	req.Header.Set("X-Auth-Token", c.token)
-	req.Header.Set("x-custom-auth", c.sitePassword)
+	if c.provider == "vps" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	} else {
+		req.Header.Set("Authorization", c.token)
+		req.Header.Set("X-Auth-Token", c.token)
+		req.Header.Set("x-custom-auth", c.sitePassword)
+	}
 	req.Header.Set("User-Agent", "SunnyRegister/1.0")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -215,11 +243,54 @@ func (c *domainMailClient) request(ctx context.Context, method, path string, bod
 }
 
 func (c *domainMailClient) addUser(ctx context.Context, email string) error {
+	// The VPS flow creates mailboxes (and issues their tokens) through
+	// createVPSMailbox instead of this CloudMail-style user endpoint.
+	if c.provider == "vps" {
+		return fmt.Errorf("自建域名邮箱 vps 渠道请使用 /v1/mailboxes 创建邮箱")
+	}
 	password := randomDomainSecret(18)
 	_, err := c.request(ctx, http.MethodPost, "/api/public/addUser", map[string]any{
 		"list": []map[string]string{{"email": email, "password": password}},
 	}, true)
 	return err
+}
+
+// createVPSMailbox creates one mailbox through the self-hosted VPS API. The
+// server generates the address from local_part + domain and returns that
+// mailbox's own token, so no second round trip is required.
+func (c *domainMailClient) createVPSMailbox(ctx context.Context, localPart, domain string) (string, string, error) {
+	payload, err := c.request(ctx, http.MethodPost, "/v1/mailboxes", map[string]any{
+		"local_part": localPart,
+		"domain":     domain,
+	}, false)
+	if err != nil {
+		return "", "", err
+	}
+	obj, ok := payload.(map[string]any)
+	if !ok {
+		return "", "", fmt.Errorf("自建域名邮箱返回内容缺少邮箱地址")
+	}
+	address := strings.ToLower(strings.TrimSpace(text(obj["address"])))
+	// A mailbox-scoped token is mandatory: falling back to the shared admin
+	// credential would expose every inbox in the pool.
+	token := strings.TrimSpace(text(obj["token"]))
+	if address == "" || !strings.Contains(address, "@") || token == "" {
+		return "", "", fmt.Errorf("自建域名邮箱返回内容缺少邮箱地址或 Token")
+	}
+	return address, token, nil
+}
+
+func vpsMailboxCredential(baseURL, email, token string) (string, error) {
+	encoded, err := json.Marshal(map[string]string{
+		"provider":   "vps",
+		"base_url":   strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+		"auth_token": token,
+		"email":      strings.ToLower(strings.TrimSpace(email)),
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
 }
 
 func (c *domainMailClient) deleteUser(ctx context.Context, email string) error {
@@ -245,6 +316,13 @@ func (c *domainMailClient) deleteUser(ctx context.Context, email string) error {
 }
 
 func (c *domainMailClient) listMessages(ctx context.Context, email string) ([]map[string]any, error) {
+	if c.provider == "vps" {
+		payload, err := c.request(ctx, http.MethodGet, "/v1/messages?address="+url.QueryEscape(email)+"&limit=20", nil, false)
+		if err != nil {
+			return nil, err
+		}
+		return domainMailVPSMessageList(payload), nil
+	}
 	payload, err := c.request(ctx, http.MethodPost, "/api/public/emailList", map[string]any{
 		"toEmail": email, "timeSort": "desc", "type": 0, "isDel": 0, "num": 1, "size": 20,
 	}, false)
@@ -252,6 +330,170 @@ func (c *domainMailClient) listMessages(ctx context.Context, email string) ([]ma
 		return nil, err
 	}
 	return domainMailMessageList(payload), nil
+}
+
+// domainMailVPSMessageList reads the self-hosted domain-mailbox-vps response
+// shape, which nests messages under a "results" array of raw MIME documents.
+func domainMailVPSMessageList(payload any) []map[string]any {
+	obj, ok := payload.(map[string]any)
+	if !ok {
+		if list, ok := payload.([]any); ok {
+			return domainMailMapList(list)
+		}
+		return nil
+	}
+	raw, ok := obj["results"].([]any)
+	if !ok {
+		return nil
+	}
+	return domainMailMapList(raw)
+}
+
+func domainMailVPSMessageItems(messages []map[string]any, email string) []map[string]any {
+	items := make([]map[string]any, 0, len(messages))
+	for _, message := range messages {
+		body, subject, sender := domainMailDecodeMIME(text(message["raw"]))
+		if subject == "" {
+			subject = text(message["subject"])
+		}
+		if sender == "" {
+			sender = firstText(message["source"], message["from"])
+		}
+		code := ""
+		if match := domainMailOTPPattern.FindStringSubmatch(domainMailPlainText(body)); len(match) > 1 {
+			code = match[1]
+		}
+		if code == "" {
+			if match := domainMailOTPPattern.FindStringSubmatch(subject); len(match) > 1 {
+				code = match[1]
+			}
+		}
+		createdAt := firstText(message["created_at"], message["createdAt"], message["receivedAt"], message["date"])
+		items = append(items, map[string]any{
+			"id":           firstText(message["id"], message["message_id"], message["messageId"]),
+			"email":        firstText(message["address"], message["to"], email),
+			"folder":       "自建域名邮箱",
+			"subject":      subject,
+			"from":         sender,
+			"to":           firstText(message["address"], message["to"], email),
+			"date":         createdAt,
+			"body":         body,
+			"body_preview": body,
+			"raw_html":     "",
+			"otp":          code,
+			"source":       "domain_api",
+		})
+	}
+	return items
+}
+
+// domainMailDecodeMIME converts a stored raw MIME document into plain text. The
+// VPS server persists the untouched message source, so quoted-printable and
+// base64 parts must be decoded before the verification code can be located.
+func domainMailDecodeMIME(raw string) (body, subject, sender string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", ""
+	}
+	message, err := mail.ReadMessage(strings.NewReader(raw))
+	if err != nil {
+		return "", "", ""
+	}
+	subject = domainMailDecodeHeader(message.Header.Get("Subject"))
+	sender = domainMailDecodeHeader(message.Header.Get("From"))
+	contentType := message.Header.Get("Content-Type")
+	mediaType, params, _ := mime.ParseMediaType(contentType)
+	charset := params["charset"]
+	plainParts := make([]string, 0, 1)
+	htmlParts := make([]string, 0, 1)
+	if strings.HasPrefix(mediaType, "multipart/") {
+		reader := multipart.NewReader(message.Body, params["boundary"])
+		for {
+			part, err := reader.NextPart()
+			if err != nil {
+				break
+			}
+			decoded := domainMailDecodePart(part.Header.Get("Content-Transfer-Encoding"), part)
+			if decoded == "" {
+				continue
+			}
+			partType, partParams, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
+			if partType == "text/plain" {
+				plainParts = append(plainParts, domainMailDecodeCharset(decoded, partParams["charset"]))
+			} else if partType == "text/html" {
+				htmlParts = append(htmlParts, domainMailDecodeCharset(decoded, partParams["charset"]))
+			}
+		}
+	} else {
+		decoded := domainMailDecodePart(message.Header.Get("Content-Transfer-Encoding"), message.Body)
+		if mediaType == "text/html" {
+			htmlParts = append(htmlParts, domainMailDecodeCharset(decoded, charset))
+		} else {
+			plainParts = append(plainParts, domainMailDecodeCharset(decoded, charset))
+		}
+	}
+	body = strings.TrimSpace(strings.Join(plainParts, "\n"))
+	if body == "" {
+		texts := make([]string, 0, len(htmlParts))
+		for _, part := range htmlParts {
+			texts = append(texts, domainMailPlainText(part))
+		}
+		body = strings.TrimSpace(strings.Join(texts, "\n"))
+	}
+	return body, subject, sender
+}
+
+func domainMailDecodePart(transferEncoding string, body io.Reader) string {
+	raw, err := io.ReadAll(io.LimitReader(body, 8<<20))
+	if err != nil {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimSpace(transferEncoding)) {
+	case "quoted-printable":
+		decoded, err := io.ReadAll(quotedprintable.NewReader(bytes.NewReader(raw)))
+		if err == nil {
+			return string(decoded)
+		}
+	case "base64":
+		cleaned := strings.Map(func(r rune) rune {
+			if r == '\r' || r == '\n' || r == ' ' || r == '\t' {
+				return -1
+			}
+			return r
+		}, string(raw))
+		if decoded, err := base64.StdEncoding.DecodeString(cleaned); err == nil {
+			return string(decoded)
+		}
+	}
+	return string(raw)
+}
+
+func domainMailDecodeCharset(value, charset string) string {
+	charset = strings.ToLower(strings.TrimSpace(charset))
+	if charset == "" || charset == "utf-8" || charset == "us-ascii" || charset == "ascii" {
+		return value
+	}
+	encoding, err := ianaindex.MIME.Encoding(charset)
+	if err != nil || encoding == nil {
+		return value
+	}
+	decoded, err := encoding.NewDecoder().Bytes([]byte(value))
+	if err != nil {
+		return value
+	}
+	return string(decoded)
+}
+
+func domainMailDecodeHeader(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	decoded, err := new(mime.WordDecoder).DecodeHeader(value)
+	if err != nil {
+		return value
+	}
+	return strings.TrimSpace(decoded)
 }
 
 func domainMailMessageList(payload any) []map[string]any {
@@ -447,6 +689,27 @@ func randomDomainEmail(domain string, length int) string {
 	return strings.ToLower(randomDomainSecret(length)) + "@" + strings.ToLower(strings.TrimSpace(domain))
 }
 
+// randomDomainLocalPart produces a lowercase alphanumeric local part. The VPS
+// server validates local parts as [a-z0-9] runs, so no separators are included.
+func randomDomainLocalPart(length int) string {
+	if length < 6 {
+		length = 6
+	}
+	if length > 32 {
+		length = 32
+	}
+	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+	raw := make([]byte, length)
+	if _, err := rand.Read(raw); err != nil {
+		return strings.ToLower(randomDomainSecret(length))
+	}
+	var builder strings.Builder
+	for _, value := range raw {
+		builder.WriteByte(alphabet[int(value)%len(alphabet)])
+	}
+	return builder.String()
+}
+
 func domainMailboxCredential(baseURL, token string) string {
 	return dumpJSON(map[string]string{"base_url": strings.TrimRight(strings.TrimSpace(baseURL), "/"), "auth_token": strings.TrimSpace(token)})
 }
@@ -510,8 +773,26 @@ func validateDomainMailboxAccessKey(value, email string) error {
 		}
 		return nil
 	}
+	if metadata, err := parseDomainMailboxMetadata(value); err == nil {
+		if provider := strings.ToLower(strings.TrimSpace(text(metadata["provider"]))); provider == "vps" || provider == "domain_mailbox_vps" {
+			// Self-hosted VPS credentials are bound to a single mailbox; reject
+			// a credential that names a different address.
+			if credentialEmail := strings.ToLower(strings.TrimSpace(text(metadata["email"]))); credentialEmail != "" && sunnyEmailKey(credentialEmail) != sunnyEmailKey(email) {
+				return fmt.Errorf("自建域名邮箱取件 URL 与邮箱名不匹配")
+			}
+			return nil
+		}
+	}
 	_, _, err := parseDomainMailboxCredential(value)
 	return err
+}
+
+func parseDomainMailboxMetadata(value string) (map[string]any, error) {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(value)), &payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
 }
 
 func domainMailboxTokenHashFromCredential(value, email string) string {
@@ -633,11 +914,43 @@ func (s *Server) domainMailboxPickupHandler(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) createDomainMailbox(ctx context.Context, cfg map[string]any, client *domainMailClient, groupID uint) (SunnyMailbox, error) {
-	pickupBaseURL, err := domainMailboxPickupBaseURL(cfg)
-	if err != nil {
-		return SunnyMailbox{}, err
-	}
 	length := intValue(cfg["random_local_length"], 12)
+	if client.provider == "vps" {
+		var lastErr error
+		for attempt := 0; attempt < 5; attempt++ {
+			domain, domainErr := nextDomainMailboxDomain(cfg)
+			if domainErr != nil {
+				return SunnyMailbox{}, domainErr
+			}
+			// The VPS server generates the address and issues a token scoped to
+			// that single mailbox; a leaked credential exposes only one inbox.
+			email, token, createErr := client.createVPSMailbox(ctx, randomDomainLocalPart(length), domain)
+			if createErr != nil {
+				lastErr = createErr
+				continue
+			}
+			var existing SunnyMailbox
+			if s.db.Where("LOWER(email) = ?", sunnyEmailKey(email)).First(&existing).Error == nil {
+				continue
+			}
+			credential, credentialErr := vpsMailboxCredential(client.baseURL, email, token)
+			if credentialErr != nil {
+				return SunnyMailbox{}, credentialErr
+			}
+			mailbox := SunnyMailbox{
+				GroupID: groupID, Email: email, MailboxType: "domain", MailboxChannel: "domain_api",
+				AccessKey: credential,
+				Raw:       sunnyURLAPIRaw(email, credential), AccountType: "free", Status: "未注册", Enabled: true, LatestMailJSON: "{}",
+			}
+			if lastErr = s.db.Create(&mailbox).Error; lastErr == nil {
+				return mailbox, nil
+			}
+		}
+		if lastErr == nil {
+			lastErr = fmt.Errorf("生成邮箱失败")
+		}
+		return SunnyMailbox{}, lastErr
+	}
 	var lastErr error
 	for attempt := 0; attempt < 5; attempt++ {
 		domain, domainErr := nextDomainMailboxDomain(cfg)
@@ -648,6 +961,10 @@ func (s *Server) createDomainMailbox(ctx context.Context, cfg map[string]any, cl
 		var existing SunnyMailbox
 		if s.db.Where("LOWER(email) = ?", sunnyEmailKey(email)).First(&existing).Error == nil {
 			continue
+		}
+		pickupBaseURL, err := domainMailboxPickupBaseURL(cfg)
+		if err != nil {
+			return SunnyMailbox{}, err
 		}
 		pickupToken, tokenErr := randomDomainPickupToken()
 		if tokenErr != nil {
