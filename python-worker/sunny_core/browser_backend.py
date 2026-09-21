@@ -17,16 +17,36 @@ class RegistrationBrowserSession:
     context: Any
 
 
+# Each entry lists the accepted sonames for one runtime dependency. The X11
+# xcb binding is shipped as ``libX11-xcb.so.1`` (capital X) by libx11-xcb1, so
+# probing only the all-lowercase spelling reported a missing library on images
+# where it is present, which blocked every headless browser launch.
+CAMOUFOX_RUNTIME_LIBRARIES: tuple[tuple[str, ...], ...] = (
+    ("libgtk-3.so.0",),
+    ("libX11-xcb.so.1", "libx11-xcb.so.1"),
+    ("libasound.so.2",),
+)
+
+
+def _loadable_library(candidates: tuple[str, ...]) -> str:
+    """Return the first soname that loads, or "" when none of them do."""
+    for name in candidates:
+        try:
+            ctypes.CDLL(name)
+        except OSError:
+            continue
+        return name
+    return ""
+
+
 def camoufox_runtime_error() -> str:
     """Return a concise container runtime error before a task can get stuck."""
     if not sys.platform.startswith("linux") or os.getenv("SUNNY_CONTAINERIZED", "").lower() not in {"1", "true", "yes"}:
         return ""
     missing: list[str] = []
-    for library in ("libgtk-3.so.0", "libx11-xcb.so.1", "libasound.so.2"):
-        try:
-            ctypes.CDLL(library)
-        except OSError:
-            missing.append(library)
+    for candidates in CAMOUFOX_RUNTIME_LIBRARIES:
+        if not _loadable_library(candidates):
+            missing.append(candidates[0])
     if not missing:
         return ""
     return (

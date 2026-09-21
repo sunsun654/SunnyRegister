@@ -816,6 +816,19 @@ func parseDomainMailboxCredential(value string) (string, string, error) {
 	return base, token, nil
 }
 
+// domainMailboxCredentialProvider reports the dialect recorded in a mailbox
+// credential. The provider marker lives in the credential itself, so callers
+// that build a client directly from one must forward it: defaulting to the
+// legacy CloudMail dialect sends self-hosted vps mailboxes to
+// /api/public/emailList, which answers HTTP 404 on the vps server.
+func domainMailboxCredentialProvider(value string) string {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(value)), &payload); err != nil {
+		return ""
+	}
+	return domainMailProvider(payload)
+}
+
 func domainMailPayload(messages []map[string]any, email string, limit int) map[string]any {
 	items := domainMailItems(messages, email)
 	if limit < 1 || limit > 50 {
@@ -889,13 +902,40 @@ func (s *Server) domainMailLatestMail(accessKey, email string, limit int) (map[s
 			return nil, parseErr
 		}
 		cfg := mergeConfig(defaultDomainMailboxConfig(), s.sunnyGetConfig(sunnyCfgDomainMailbox, defaultDomainMailboxConfig()))
-		client := &domainMailClient{baseURL: base, token: token, sitePassword: strings.TrimSpace(text(cfg["site_password"])), client: &http.Client{Timeout: 30 * time.Second}}
+		// The credential's own provider marker decides the API dialect; the
+		// client default (cloudmail) is wrong for self-hosted vps mailboxes.
+		provider := domainMailboxCredentialProvider(trimmed)
+		if provider == "" {
+			provider = domainMailProvider(cfg)
+		}
+		client := &domainMailClient{baseURL: base, token: token, sitePassword: strings.TrimSpace(text(cfg["site_password"])), provider: provider, client: &http.Client{Timeout: 30 * time.Second}}
 		messages, err = client.listMessages(context.Background(), email)
 	}
 	if err != nil {
 		return nil, err
 	}
 	return domainMailPayload(messages, email, limit), nil
+}
+
+// fetchDomainMailSubjects collects the newest message text for a self-hosted
+// domain mailbox so the account health check can look for a deactivation
+// notice. Domain mailboxes authenticate with their own pickup credential and
+// therefore need this dedicated path instead of the Outlook OAuth fallback.
+func (s *Server) fetchDomainMailSubjects(accessKey, email string, limit int) ([]string, error) {
+	payload, err := s.domainMailLatestMail(accessKey, email, limit)
+	if err != nil {
+		return nil, err
+	}
+	items, _ := payload["items"].([]map[string]any)
+	subjects := make([]string, 0, len(items))
+	for _, item := range items {
+		subject := strings.TrimSpace(text(item["subject"]))
+		body := strings.TrimSpace(text(item["body"]))
+		if combined := strings.TrimSpace(subject + "\n" + body); combined != "" {
+			subjects = append(subjects, combined)
+		}
+	}
+	return subjects, nil
 }
 
 func (s *Server) domainMailboxPickupHandler(w http.ResponseWriter, r *http.Request) {

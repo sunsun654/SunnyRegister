@@ -232,6 +232,11 @@ func (s *Server) executeSunnyAccountHealthCheckTask(task *Task, payload map[stri
 			subjects, fetchErr = fetchXbovoHealthMailEvidence(candidate.Email, candidate.AccessKey, 5, proxyURL)
 		} else if candidate.MailboxType == "apple" && candidate.Channel == "url_api" {
 			subjects, fetchErr = fetchURLAPIMailSubjects(candidate.Email, candidate.AccessKey, 5, proxyURL)
+		} else if candidate.MailboxType == "domain" {
+			// Self-hosted domain mailboxes read through the provider API with
+			// their own credential. They carry no Outlook client_id, so they
+			// must never fall through to the Microsoft OAuth branches below.
+			subjects, fetchErr = s.fetchDomainMailSubjects(candidate.AccessKey, candidate.Email, 5)
 		} else if strings.TrimSpace(proxyURL) != "" {
 			var token string
 			for _, endpoint := range hotmailGraphTokenEndpoints {

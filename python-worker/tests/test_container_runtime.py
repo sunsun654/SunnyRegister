@@ -38,6 +38,53 @@ class CamoufoxRuntimeTests(unittest.TestCase):
 
         self.assertIn("libgtk-3.so.0", error)
 
+    def test_capital_x11_xcb_soname_is_accepted(self) -> None:
+        """Regression: libx11-xcb1 ships libX11-xcb.so.1 with a capital X.
+
+        Probing only the lowercase spelling made every headless Camoufox launch
+        fail with a bogus "missing dependencies" error, which surfaced as
+        Access Token renewal failures even though the library was present.
+        """
+        loaded: list[str] = []
+
+        def load_library(name: str):
+            loaded.append(name)
+            # Only the real (capitalised) soname resolves, as in the image.
+            if name == "libX11-xcb.so.1":
+                return object()
+            if name == "libx11-xcb.so.1":
+                raise OSError("cannot open shared object file")
+            return object()
+
+        with (
+            patch("sunny_core.browser_backend.sys.platform", "linux"),
+            patch.dict(os.environ, {"SUNNY_CONTAINERIZED": "true"}),
+            patch("sunny_core.browser_backend.ctypes.CDLL", side_effect=load_library),
+        ):
+            error = camoufox_runtime_error()
+
+        self.assertEqual(error, "")
+        self.assertIn("libX11-xcb.so.1", loaded)
+
+    def test_lowercase_x11_xcb_soname_still_accepted(self) -> None:
+        """Images that only expose the lowercase soname must keep working."""
+
+        def load_library(name: str):
+            if name == "libx11-xcb.so.1":
+                return object()
+            if name == "libX11-xcb.so.1":
+                raise OSError("cannot open shared object file")
+            return object()
+
+        with (
+            patch("sunny_core.browser_backend.sys.platform", "linux"),
+            patch.dict(os.environ, {"SUNNY_CONTAINERIZED": "true"}),
+            patch("sunny_core.browser_backend.ctypes.CDLL", side_effect=load_library),
+        ):
+            error = camoufox_runtime_error()
+
+        self.assertEqual(error, "")
+
 
 class OutlookImapRouteTests(unittest.TestCase):
     def test_direct_then_dedicated_proxy(self) -> None:
