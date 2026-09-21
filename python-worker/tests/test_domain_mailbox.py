@@ -83,7 +83,8 @@ def test_domain_reader_prefers_body_code_and_parses_cloudmail_utc(monkeypatch):
     assert current["timestamp"] == datetime(2026, 8, 24, 7, 34, 15, tzinfo=timezone.utc).timestamp()
 
 
-def test_domain_reader_filters_old_message(monkeypatch):
+def test_domain_reader_ignores_message_already_seen_at_connect(monkeypatch):
+    """The connect() baseline, not a wall-clock floor, defines what is "old"."""
     reader = DomainMailReader(
         account_from_row({"email": "user@example.com", "mailbox_type": "domain", "access_key": _credential()}),
         None,
@@ -91,12 +92,35 @@ def test_domain_reader_filters_old_message(monkeypatch):
     monkeypatch.setattr(reader, "_request", lambda: {"items": [
         {"id": 1, "receivedAt": "2020-01-01T00:00:00Z", "verificationCode": "111111"},
     ]})
+
+    reader.connect()
     try:
         reader.wait_for_code(2000000000, timeout=0.05)
     except TimeoutError:
         pass
     else:
-        raise AssertionError("old domain mailbox message must not satisfy a newer baseline")
+        raise AssertionError("a message already seen at connect() must not be returned as a fresh code")
+
+
+def test_domain_reader_accepts_code_whose_timestamp_lags_the_request(monkeypatch):
+    """Regression: provider ingestion lag must not hide a delivered OTP.
+
+    The mailbox reported the OTP as arriving before the request-side baseline,
+    which the previous timestamp filter discarded, so registration timed out
+    even though the code was sitting in the inbox.
+    """
+    reader = DomainMailReader(
+        account_from_row({"email": "user@example.com", "mailbox_type": "domain", "access_key": _credential()}),
+        None,
+    )
+    # Baseline sees nothing; the OTP that follows is therefore new.
+    monkeypatch.setattr(reader, "_request", lambda: {"items": []})
+    reader.connect()
+    monkeypatch.setattr(reader, "_request", lambda: {"items": [
+        {"id": 9, "receivedAt": "2020-01-01T00:00:00Z", "verificationCode": "978744"},
+    ]})
+
+    assert reader.wait_for_code(2000000000, timeout=1) == "978744"
 
 
 def test_domain_reader_accepts_unix_millisecond_timestamp(monkeypatch):

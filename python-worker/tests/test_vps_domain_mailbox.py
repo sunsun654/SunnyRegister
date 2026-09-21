@@ -196,15 +196,41 @@ def test_reader_rejects_credential_without_base_url():
         VpsDomainReader(account, None)
 
 
-def test_wait_for_code_ignores_message_older_than_baseline(monkeypatch):
+def test_wait_for_code_ignores_message_already_seen_at_connect(monkeypatch):
+    """The connect() baseline, not a wall-clock floor, defines what is "old"."""
     reader = VpsDomainReader(_account(), None)
     payload = {"results": [
         {"id": 1, "created_at": "2020-01-01T00:00:00Z", "raw": REAL_OTP_EMAIL},
     ]}
     monkeypatch.setattr("sunny_core.mailbox.requests.get", lambda *a, **k: _Response(payload))
 
+    reader.connect()
     with pytest.raises(TimeoutError):
         reader.wait_for_code(2000000000, timeout=0.05)
+
+
+def test_wait_for_code_accepts_otp_whose_provider_timestamp_lags_the_request(monkeypatch):
+    """Regression for the production registration timeout.
+
+    The VPS stamps ``created_at`` with its own ingestion time, which trails the
+    OpenAI send by minutes. The old timestamp floor compared that stamp against
+    ``time.time()`` and therefore rejected the freshly delivered OTP, so the
+    task failed with "重新发送协议验证码后等待 60 秒仍未收到验证码" while the code
+    was already present in the inbox.
+    """
+    reader = VpsDomainReader(_account(), None)
+
+    # No mail yet when the reader establishes its baseline.
+    monkeypatch.setattr("sunny_core.mailbox.requests.get", lambda *a, **k: _Response({"results": []}))
+    reader.connect()
+
+    # The OTP then arrives, stamped far earlier than min_timestamp.
+    payload = {"results": [
+        {"id": 7, "created_at": "2020-01-01T00:00:00Z", "raw": REAL_OTP_EMAIL},
+    ]}
+    monkeypatch.setattr("sunny_core.mailbox.requests.get", lambda *a, **k: _Response(payload))
+
+    assert reader.wait_for_code(2000000000, timeout=1) == "096480"
 
 
 def test_wait_for_code_returns_new_message(monkeypatch):

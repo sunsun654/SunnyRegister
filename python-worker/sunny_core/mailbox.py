@@ -1289,6 +1289,9 @@ class RemailReader:
         return {"id": current.get("id") or current.get("key", "remail"), "email": self.account.email, "from": current.get("sender", ""), "to": current.get("recipient", self.account.email), "subject": current.get("subject") or "Remail", "date": current.get("date", ""), "body": current.get("body", ""), "body_preview": current.get("body", ""), "otp": current.get("code", ""), "source": "remail_api"}
 
     def wait_for_code(self, min_timestamp: float, timeout: int = 120) -> str:
+        # ``min_timestamp`` is accepted for call-site compatibility only and is
+        # intentionally not used as a filter; see the key check below.
+        del min_timestamp
         started = time.monotonic()
         while time.monotonic() - started < timeout:
             try:
@@ -1298,10 +1301,15 @@ class RemailReader:
                     raise
                 time.sleep(2)
                 continue
-            timestamp = float(current.get("timestamp") or 0)
             key = str(current.get("key") or "")
             code = str(current.get("code") or "").strip()
-            if code and re.fullmatch(r"\d{6}", code) and key not in self.seen_keys and (not timestamp or timestamp >= float(min_timestamp or 0)):
+            # Deduplication is driven purely by the message key: the mailbox
+            # ``connect()`` baseline already marks every pre-existing message as
+            # seen, so a message that is not yet in ``seen_keys`` is by
+            # definition new. Comparing wall-clock timestamps against a
+            # request-side baseline is unreliable because provider ingestion lag
+            # makes a freshly delivered OTP look older than the request.
+            if code and re.fullmatch(r"\d{6}", code) and key and key not in self.seen_keys:
                 self.seen_keys.add(key)
                 self.log(f"[{self.account.email}] 已通过 Remail API 收到邮箱验证码（已脱敏）")
                 return code
@@ -1465,6 +1473,9 @@ class DomainMailReader:
         return {"id": current.get("id") or current.get("key", "domain"), "email": self.account.email, "from": current.get("sender", ""), "to": current.get("recipient", self.account.email), "subject": current.get("subject") or "Domain mailbox", "date": current.get("date", ""), "body": current.get("body", ""), "body_preview": current.get("body", ""), "otp": current.get("code", ""), "source": "domain_api"}
 
     def wait_for_code(self, min_timestamp: float, timeout: int = 120) -> str:
+        # ``min_timestamp`` is accepted for call-site compatibility only and is
+        # intentionally not used as a filter; see the key check below.
+        del min_timestamp
         started = time.monotonic()
         last_error_notice = 0.0
         while time.monotonic() - started < timeout:
@@ -1479,10 +1490,11 @@ class DomainMailReader:
                     last_error_notice = time.monotonic()
                 time.sleep(min(3, remaining))
                 continue
-            timestamp = float(current.get("timestamp") or 0)
             key = str(current.get("key") or "")
             code = str(current.get("code") or "").strip()
-            if code and re.fullmatch(r"\d{6}", code) and key not in self.seen_keys and (not timestamp or timestamp >= float(min_timestamp or 0)):
+            # See RemailReader.wait_for_code: newness is decided by the message
+            # key recorded in ``connect()``, never by a wall-clock comparison.
+            if code and re.fullmatch(r"\d{6}", code) and key and key not in self.seen_keys:
                 self.seen_keys.add(key)
                 self.log(f"[{self.account.email}] 已通过自建域名邮箱 API 收到验证码（已脱敏）")
                 return code
@@ -1722,6 +1734,9 @@ class VpsDomainReader:
         return {"id": current.get("id") or current.get("key", "domain"), "email": self.account.email, "from": current.get("sender", ""), "to": current.get("recipient", self.account.email), "subject": current.get("subject") or "Domain mailbox", "date": current.get("date", ""), "body": current.get("body", ""), "body_preview": current.get("body", ""), "otp": current.get("code", ""), "source": "domain_api"}
 
     def wait_for_code(self, min_timestamp: float, timeout: int = 120) -> str:
+        # ``min_timestamp`` is accepted for call-site compatibility only and is
+        # intentionally not used as a filter; see the key check below.
+        del min_timestamp
         started = time.monotonic()
         last_error_notice = 0.0
         while time.monotonic() - started < timeout:
@@ -1736,10 +1751,15 @@ class VpsDomainReader:
                     last_error_notice = time.monotonic()
                 time.sleep(min(3, remaining))
                 continue
-            timestamp = float(current.get("timestamp") or 0)
             key = str(current.get("key") or "")
             code = str(current.get("code") or "").strip()
-            if code and re.fullmatch(r"\d{6}", code) and key not in self.seen_keys and (not timestamp or timestamp >= float(min_timestamp or 0)):
+            # See RemailReader.wait_for_code: newness is decided by the message
+            # key recorded in ``connect()``, never by a wall-clock comparison.
+            # The VPS stores ``created_at`` as provider ingestion time, which
+            # lags the OpenAI send by minutes, so a timestamp floor derived from
+            # ``time.time()`` systematically discarded the OTP that was actually
+            # waiting in the inbox.
+            if code and re.fullmatch(r"\d{6}", code) and key and key not in self.seen_keys:
                 self.seen_keys.add(key)
                 self.log(f"[{self.account.email}] 已通过自建域名邮箱 API 收到验证码（已脱敏）")
                 return code
